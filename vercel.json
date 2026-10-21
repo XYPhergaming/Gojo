@@ -1,0 +1,13 @@
+{
+  "version": 2,
+  "rewrites": [
+    { "source": "/api/(.*)", "destination": "/v00/m00/u00/rABC/api/backend.js" },
+    { "source": "/(.*)", "destination": "/frontend/$1" }
+  ],
+  "functions": {
+    "v00/m00/u00/rABC/api/backend.js": {
+      "memory": 1024,
+      "maxDuration": 60
+    }
+  }
+}
