@@ -1,6 +1,10 @@
 {
+  "version": 2,
   "rewrites": [
-    { "source": "/api/:path*", "destination": "/api" },
-    { "source": "/:path*", "destination": "/frontend/:path*" }
-  ]
+    { "source": "/api/(.*)", "destination": "/api/backend" },
+    { "source": "/(.*)", "destination": "/frontend/index.html" }
+  ],
+  "functions": {
+    "api/backend.js": { "memory": 1024, "maxDuration": 60 }
+  }
 }
