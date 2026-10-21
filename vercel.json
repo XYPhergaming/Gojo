@@ -1,13 +1,11 @@
 {
   "version": 2,
-  "rewrites": [
-    { "source": "/api/(.*)", "destination": "/v00/m00/u00/rABC/api/backend.js" },
-    { "source": "/(.*)", "destination": "/frontend/index.html" }
+  "builds": [
+    { "src": "frontend/**", "use": "@vercel/static" },
+    { "src": "v00/m00/u00/rABC/api/backend.js", "use": "@vercel/node" }
   ],
-  "functions": {
-    "v00/m00/u00/rABC/api/backend.js": {
-      "memory": 1024,
-      "maxDuration": 30
-    }
-  }
+  "routes": [
+    { "src": "/api/(.*)", "dest": "/v00/m00/u00/rABC/api/backend.js" },
+    { "src": "/(.*)", "dest": "/frontend/$1" }
+  ]
 }
