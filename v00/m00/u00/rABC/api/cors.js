@@ -1,17 +1,20 @@
-import cors from 'cors';
+const cors = require('cors');
+const config = require('./api');
 
-const raw = (process.env.ALLOWED_ORIGIN || '*').trim();
-const allowed = raw.split(',').map((s) => s.trim()).filter(Boolean);
+const allowlist = config.corsOrigins;
 
-export const corsMiddleware = cors({
-  origin: (origin, cb) => {
+const options = {
+  origin: function (origin, cb) {
     if (!origin) return cb(null, true);
-    if (allowed.includes('*') || allowed.includes(origin)) return cb(null, true);
+    if (allowlist.includes('*')) return cb(null, true);
+    if (allowlist.includes(origin)) return cb(null, true);
     return cb(null, false);
   },
-  credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
-});
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  exposedHeaders: [],
+  credentials: false,
+  maxAge: 86400
+};
 
-export default corsMiddleware;
+module.exports = cors(options);

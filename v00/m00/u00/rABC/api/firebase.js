@@ -1,17 +1,26 @@
-import admin from 'firebase-admin';
+const admin = require('firebase-admin');
+const config = require('./api');
 
-if (!admin.apps.length) {
-  const privateKey = (process.env.FIREBASE_PRIVATE_KEY || '').replace(/\\n/g, '\n');
+let initialized = false;
+
+function init() {
+  if (initialized && admin.apps.length) return admin;
+  if (admin.apps.length) { initialized = true; return admin; }
+  const sa = config.firebase.serviceAccount;
+  if (!sa) {
+    throw new Error('Firebase service account not configured. Set FIREBASE_SERVICE_ACCOUNT_JSON in .env');
+  }
   admin.initializeApp({
-    credential: admin.credential.cert({
-      projectId: process.env.FIREBASE_PROJECT_ID,
-      clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-      privateKey
-    })
+    credential: admin.credential.cert(sa),
+    projectId: config.firebase.projectId || sa.projectId
   });
+  initialized = true;
+  return admin;
 }
 
-export const auth = admin.auth();
-export const db = admin.firestore();
-export const FieldValue = admin.firestore.FieldValue;
-export default admin;
+function auth() { return init().auth(); }
+function db() { return init().firestore(); }
+function FieldValue() { init(); return admin.firestore.FieldValue; }
+function Timestamp() { init(); return admin.firestore.Timestamp; }
+
+module.exports = { init, auth, db, FieldValue, Timestamp };
