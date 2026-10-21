@@ -1,10 +1,15 @@
 {
   "version": 2,
+  "builds": [
+    { "src": "api/backend.js", "use": "@vercel/node" }
+  ],
   "rewrites": [
-    { "source": "/api/(.*)", "destination": "/api/backend" },
-    { "source": "/(.*)", "destination": "/frontend/index.html" }
+    { "source": "/api/(.*)", "destination": "/api/backend" }
   ],
   "functions": {
-    "api/backend.js": { "memory": 1024, "maxDuration": 60 }
+    "api/backend.js": {
+      "memory": 1024,
+      "maxDuration": 30
+    }
   }
 }
