@@ -1,65 +1,83 @@
-const jwt = require('jsonwebtoken');
-const { jwtSecret } = require('./api');
+// api/utils.js — Pure helper functions, no dependencies
 
-const escapeHtml = (v = '') => String(v)
-  .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-  .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+export const escapeHtml = (v = '') =>
+  String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 
-const isValidEmail = (e) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(e || ''));
-const isValidUrl = (u) => /^https?:\/\//i.test(String(u || ''));
-const safeString = (v, max = 2000) => typeof v === 'string' ? v.slice(0, max) : '';
-const safeId = (id) => String(id || '').replace(/[^a-zA-Z0-9_-]/g, '');
+export const safeString = (v, maxLen = 2000) =>
+  typeof v === 'string' ? v.slice(0, maxLen) : '';
 
-const DEFAULT_AVATAR = 'https://upload.wikimedia.org/wikipedia/commons/7/7c/Profile_avatar_placeholder_large.png';
-const validImageUrl = (url, fb = DEFAULT_AVATAR) => {
+export const getTodayKey = () => new Date().toDateString();
+
+export const validImageUrl = (
+  url,
+  fb = 'https://upload.wikimedia.org/wikipedia/commons/7/7c/Profile_avatar_placeholder_large.png'
+) => {
   if (typeof url !== 'string') return fb;
   if (!/^https?:\/\//i.test(url)) return fb;
   return url;
 };
 
-function signSession(uid) {
-  return jwt.sign({ uid }, jwtSecret, { expiresIn: '30d' });
-}
+export const safeUrl = (url, fb = '#') => {
+  if (typeof url !== 'string') return fb;
+  if (!/^https?:\/\//i.test(url)) return fb;
+  return url;
+};
 
-function verifySession(token) {
-  return jwt.verify(token, jwtSecret);
-}
+export const toNumber = (v, def = 0) => {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : def;
+};
 
-function requireAuth(req, res, next) {
-  const cookieToken = req.cookies?.session;
-  const bearer = (req.headers.authorization || '').replace('Bearer ', '');
-  const token = cookieToken || bearer;
-  if (!token) return res.status(401).json({ error: 'Not authenticated' });
-  try {
-    req.uid = verifySession(token).uid;
-    next();
-  } catch (e) {
-    return res.status(401).json({ error: 'Session expired' });
-  }
-}
+export const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
 
-const _limits = new Map();
-function checkRate(key, max, windowMs) {
-  const now = Date.now();
-  let entry = _limits.get(key);
-  if (!entry || now > entry.reset) entry = { count: 0, reset: now + windowMs };
-  entry.count++;
-  _limits.set(key, entry);
-  return entry.count <= max;
-}
+export const sanitizeCSS = (css, maxLen = 4000) => {
+  if (typeof css !== 'string') return '';
+  if (css.length > maxLen) css = css.slice(0, maxLen);
+  css = css.replace(/\/\*[\s\S]*?\*\//g, '');
+  css = css.replace(/@import[^;]*;?/gi, '');
+  css = css.replace(/@charset[^;]*;?/gi, '');
+  css = css.replace(/@namespace[^;]*;?/gi, '');
+  css = css.replace(/<\/?style[^>]*>/gi, '');
+  css = css.replace(/url\(\s*(['"]?)(?!data:)[^)]*\)/gi, '');
+  if (/expression\s*\(/i.test(css)) return '';
+  if (/javascript\s*:/i.test(css)) return '';
+  if (/behavior\s*:/i.test(css)) return '';
+  if (/-moz-binding/i.test(css)) return '';
+  if (/<script/i.test(css)) return '';
+  return css;
+};
 
-function friendlyError(error) {
-  if (!error) return 'Something went wrong';
+export const getFriendlyError = (error) => {
+  if (!error) return 'Something went wrong. Please try again.';
+  const code = error.code || '';
   const map = {
-    'auth/invalid-credential': 'Invalid credentials',
-    'permission-denied': 'Permission denied',
-    'not-found': 'Not found',
-    'unavailable': 'Service unavailable',
+    'auth/invalid-credential': 'Incorrect email or password.',
+    'auth/invalid-email': 'Please enter a valid email address.',
+    'auth/user-not-found': 'No account found with this email.',
+    'auth/wrong-password': 'Incorrect password.',
+    'auth/user-disabled': 'This account has been disabled.',
+    'auth/too-many-requests': 'Too many attempts. Wait a moment.',
+    'auth/email-already-in-use': 'Email already in use by another account.',
+    'auth/credential-already-in-use': 'This credential is already used by another account.',
+    'auth/account-exists-with-different-credential': 'An account with this email exists using a different sign-in method.',
+    'auth/weak-password': 'Password too weak. Use 6+ characters.',
+    'auth/network-request-failed': 'Network error.',
+    'auth/popup-closed-by-user': 'You closed the login window.',
+    'auth/popup-blocked': 'Browser blocked popup.',
+    'auth/requires-recent-login': 'Please sign in again to change this.',
+    'auth/operation-not-supported-in-this-environment': 'This browser does not support popup sign-in.',
+    'auth/provider-already-linked': 'This sign-in method is already linked to your account.',
+    'auth/no-such-provider': 'No such provider linked.',
+    'permission-denied': 'Permission denied.',
+    'not-found': 'Data not found.',
+    'unavailable': 'Server temporarily unavailable.',
+    'deadline-exceeded': 'Server not responding.',
+    'unauthenticated': 'Please sign in again.'
   };
-  return map[error.code] || error.message || 'Something went wrong';
-}
-
-module.exports = {
-  escapeHtml, isValidEmail, isValidUrl, safeString, safeId, validImageUrl,
-  signSession, verifySession, requireAuth, checkRate, friendlyError, DEFAULT_AVATAR,
+  if (code && map[code]) return map[code];
+  if (error.message && /cannot be changed/i.test(error.message)) return error.message;
+  if (error.message && /already/i.test(error.message)) return error.message;
+  if (error.message && error.message.length < 200) return error.message;
+  return 'Something went wrong. Please try again.';
 };

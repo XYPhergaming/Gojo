@@ -1,862 +1,658 @@
-const admin = require('firebase-admin');
-const bcrypt = require('bcryptjs');
-const { OAuth2Client } = require('google-auth-library');
-const { firebase, googleClientId, imgbbKey, geminiKey, apis } = require('./api');
-const {
-  isValidEmail, safeString, validImageUrl, signSession
-} = require('./utils');
+// api/script.js — All business logic, Firestore operations, atomic transactions
 
-if (!admin.apps.length) {
-  admin.initializeApp({
-    credential: admin.credential.cert({
-      projectId: firebase.projectId,
-      clientEmail: firebase.clientEmail,
-      privateKey: firebase.privateKey,
-    }),
-  });
-}
-const db = admin.firestore();
-const googleClient = new OAuth2Client(googleClientId);
+import {
+  adminDb, adminAuth, FieldValue,
+  fetchAnimeDetails, traceMoe, geminiDetect, imgbbUpload,
+  fetchKitsuEpisodeTitle
+} from './api.js';
+import {
+  validImageUrl, safeString, getTodayKey, toNumber, clamp, getFriendlyError
+} from './utils.js';
 
 const DEFAULT_CONFIG = {
   dailyBonus: 50, maxUpcoming: 3, maxPrime: 3, maxFavourite: 4,
   rankThresholds: { D: 250, C: 500, B: 750, A: 1000 }
 };
 
-async function getAppConfig() {
+export async function loadAppConfig() {
   try {
-    const snap = await db.doc('meta/config').get();
-    if (snap.exists) {
-      const data = snap.data();
-      return {
-        ...DEFAULT_CONFIG, ...data,
-        rankThresholds: { ...DEFAULT_CONFIG.rankThresholds, ...(data.rankThresholds || {}) }
-      };
-    }
-  } catch (e) { }
-  return { ...DEFAULT_CONFIG };
+    const snap = await adminDb.doc('meta/config').get();
+    if (!snap.exists) return { ...DEFAULT_CONFIG };
+    const data = snap.data();
+    return {
+      ...DEFAULT_CONFIG, ...data,
+      rankThresholds: { ...DEFAULT_CONFIG.rankThresholds, ...(data.rankThresholds || {}) }
+    };
+  } catch (e) {
+    console.warn('Config load failed:', e.message);
+    return { ...DEFAULT_CONFIG };
+  }
 }
 
-function computeRank(exp, thresholds) {
+// ---- Rank calculation ----
+export function calculateRank(exp, thresholds) {
   const th = thresholds || DEFAULT_CONFIG.rankThresholds;
-  if (exp >= th.A) return 'A';
-  if (exp >= th.B) return 'B';
-  if (exp >= th.C) return 'C';
-  if (exp >= th.D) return 'D';
-  return 'E';
+  if (exp >= th.A) return { rank: 'A', target: th.A };
+  if (exp >= th.B) return { rank: 'B', target: th.A };
+  if (exp >= th.C) return { rank: 'C', target: th.B };
+  if (exp >= th.D) return { rank: 'D', target: th.C };
+  return { rank: 'E', target: th.D };
 }
 
+// ---- Dedupe anime by malId ----
+function dedupeList(arr) {
+  if (!Array.isArray(arr)) return [];
+  const m = new Map();
+  arr.forEach(it => {
+    if (it && it.malId && String(it.malId).trim() !== '' && String(it.malId) !== 'undefined') {
+      m.set(String(it.malId), it);
+    }
+  });
+  return Array.from(m.values());
+}
+
+// ---- Bank helper (in transaction) ----
+async function getBankAndAdmin(tx) {
+  const bankRef = adminDb.doc('meta/bank');
+  const bankSnap = await tx.get(bankRef);
+  if (!bankSnap.exists) throw new Error('Bank not initialized.');
+  const bank = bankSnap.data();
+  const adminRef = adminDb.doc('admins/' + bank.treasuryAdminUid);
+  const adminSnap = await tx.get(adminRef);
+  if (!adminSnap.exists) throw new Error('Treasury admin missing.');
+  return { bankRef, bank, adminRef, admin: adminSnap.data() };
+}
+
+// ---- Generate UID ----
 async function generateNextUID() {
-  const ref = db.doc('meta/uidCounter');
-  return await db.runTransaction(async (tx) => {
-    const snap = await tx.get(ref);
+  const counterRef = adminDb.doc('meta/uidCounter');
+  return await adminDb.runTransaction(async tx => {
+    const snap = await tx.get(counterRef);
     let n = 1000000000;
     if (snap.exists && snap.data().current) n = snap.data().current + 1;
-    tx.set(ref, { current: n }, { merge: true });
+    tx.set(counterRef, { current: n }, { merge: true });
     return String(n);
   });
 }
 
-// ---------- GOOGLE AUTH ----------
-async function handleGoogleAuth(idToken) {
-  const ticket = await googleClient.verifyIdToken({ idToken, audience: googleClientId });
-  const payload = ticket.getPayload();
-  const uid = payload.sub;
-  const userRef = db.collection('users').doc(uid);
-  let snap = await userRef.get();
-
-  if (!snap.exists) {
-    // Check if a user with this email already exists (backup email conflict)
-    const emailCheck = await db.collection('users').where('backupEmail', '==', (payload.email || '').toLowerCase()).limit(1).get();
-    if (!emailCheck.empty) throw new Error('This email is already used as a backup email on another account');
-
-    const customId = await generateNextUID();
-    const newUser = {
-      uid, customId, email: (payload.email || '').toLowerCase(), backupEmail: '',
-      name: safeString(payload.name || 'Hunter', 60),
-      avatar: validImageUrl(payload.picture),
-      totalExp: 0, rank: 'E', coins: 0, lastClaim: '', activeBorder: '',
-      isVerified: false, isBanned: false, ownedItems: [], upcoming: [], collection: [],
-      prime: [], favourite: [], followers: [], following: [], setupCompleted: false,
-      expHistory: [],
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-    };
-    await userRef.set(newUser);
-    snap = await userRef.get();
-  }
-  const user = snap.data();
-  if (user.isBanned) throw new Error('Account banned: ' + (user.banReason || 'Violation'));
-  return { user: { id: snap.id, ...user }, token: signSession(uid) };
+// ---- Create user ----
+export async function createUser(uid, authData = {}) {
+  const customId = await generateNextUID();
+  const nu = {
+    uid, customId,
+    email: authData.email || '',
+    backupEmail: '',
+    name: safeString(authData.name || 'Gojo Hunter', 60),
+    avatar: validImageUrl(authData.picture),
+    totalExp: 0, rank: 'E', coins: 0, lastClaim: '',
+    activeBorder: '', isVerified: false, isBanned: false,
+    ownedItems: [], upcoming: [], collection: [], prime: [], favourite: [],
+    followers: [], following: [], expHistory: [],
+    setupCompleted: false,
+    createdAt: FieldValue.serverTimestamp()
+  };
+  await adminDb.doc('users/' + uid).set(nu);
+  return nu;
 }
 
-// ---------- BACKUP EMAIL AUTH ----------
-async function handleBackupLogin(email, password) {
-  const q = db.collection('users').where('backupEmail', '==', (email || '').toLowerCase()).limit(1);
-  const snap = await q.get();
-  if (snap.empty) throw new Error('Invalid credentials');
-  const doc = snap.docs[0];
-  const user = doc.data();
-  const privSnap = await doc.ref.collection('private').doc('auth').get();
-  if (!privSnap.exists) throw new Error('No password set for this account');
-  const ok = await bcrypt.compare(password || '', privSnap.data().passwordHash);
-  if (!ok) throw new Error('Invalid credentials');
-  if (user.isBanned) throw new Error('Account banned');
-  return { user: { id: doc.id, ...user }, token: signSession(doc.id) };
-}
-
-async function linkBackupEmail(uid, email, password) {
-  email = (email || '').toLowerCase();
-  if (!isValidEmail(email)) throw new Error('Invalid email');
-  if (!password || password.length < 6) throw new Error('Password must be 6+ characters');
-
-  const userRef = db.collection('users').doc(uid);
-  const snap = await userRef.get();
-  if (!snap.exists) throw new Error('User not found');
-  if ((snap.data().backupEmail || '').trim()) throw new Error('Backup email already set and cannot be changed');
-
-  const existing = await db.collection('users').where('backupEmail', '==', email).limit(1).get();
-  if (!existing.empty) throw new Error('Email already used as backup');
-
-  if ((snap.data().email || '').toLowerCase() === email) throw new Error('Cannot use your Google email as backup');
-
-  const hash = await bcrypt.hash(password, 10);
-  await userRef.update({ backupEmail: email });
-  await userRef.collection('private').doc('auth').set({ passwordHash: hash });
-}
-
-async function changePassword(uid, currentPassword, newPassword) {
-  if (!newPassword || newPassword.length < 6) throw new Error('Password must be 6+ characters');
-  const ref = db.collection('users').doc(uid).collection('private').doc('auth');
-  const snap = await ref.get();
-  if (!snap.exists) throw new Error('No password set');
-  const ok = await bcrypt.compare(currentPassword || '', snap.data().passwordHash);
-  if (!ok) throw new Error('Current password incorrect');
-  await ref.set({ passwordHash: await bcrypt.hash(newPassword, 10) });
-}
-
-// ---------- USER ----------
-async function getUser(uid) {
-  const snap = await db.collection('users').doc(uid).get();
-  if (!snap.exists) throw new Error('User not found');
+// ---- Get user ----
+export async function getUser(uid) {
+  const snap = await adminDb.doc('users/' + uid).get();
+  if (!snap.exists) return null;
   return { id: snap.id, ...snap.data() };
 }
 
-async function getPublicUser(uid) {
-  const u = await getUser(uid);
-  const { email, backupEmail, ...pub } = u;
-  return pub;
-}
-
-async function updateUserProfile(uid, { name, avatar }) {
-  const updates = {};
-  if (name) updates.name = safeString(String(name).trim(), 60);
-  if (avatar && validImageUrl(avatar)) updates.avatar = avatar;
-  if (Object.keys(updates).length === 0) throw new Error('No valid fields to update');
-  await db.collection('users').doc(uid).update(updates);
-  return await getUser(uid);
-}
-
-async function completeSetup(uid, { name, avatar }) {
-  if (!name || !String(name).trim()) throw new Error('Name required');
-  const updates = {
-    name: safeString(String(name).trim(), 60),
-    avatar: avatar ? validImageUrl(avatar) : undefined,
-    setupCompleted: true,
+// ---- Sanitize user data (called on read) ----
+export function sanitizeForPublic(userData) {
+  if (!userData) return null;
+  return {
+    uid: userData.uid,
+    customId: userData.customId,
+    name: userData.name,
+    avatar: userData.avatar,
+    rank: userData.rank,
+    totalExp: toNumber(userData.totalExp),
+    isVerified: !!userData.isVerified,
+    activeBorder: userData.activeBorder || '',
+    collection: Array.isArray(userData.collection) ? userData.collection : [],
+    prime: Array.isArray(userData.prime) ? userData.prime : [],
+    favourite: Array.isArray(userData.favourite) ? userData.favourite : [],
+    upcoming: Array.isArray(userData.upcoming) ? userData.upcoming : [],
+    followers: Array.isArray(userData.followers) ? userData.followers : []
   };
-  if (!updates.avatar) delete updates.avatar;
-  await db.collection('users').doc(uid).update(updates);
-  return await getUser(uid);
 }
 
-async function searchUserByUid(customId) {
-  if (!/^\d{10}$/.test(String(customId || ''))) throw new Error('UID must be 10 digits');
-  const snap = await db.collection('users').where('customId', '==', String(customId)).limit(1).get();
-  if (snap.empty) return null;
-  const d = snap.docs[0];
-  const u = d.data();
-  return { uid: d.id, customId: u.customId, name: u.name, avatar: u.avatar, rank: u.rank || 'E' };
+// ---- Sanitize full user data (for self) ----
+export function sanitizeForSelf(userData) {
+  if (!userData) return null;
+  return {
+    ...userData,
+    coins: toNumber(userData.coins),
+    totalExp: toNumber(userData.totalExp),
+    collection: dedupeList(userData.collection),
+    upcoming: dedupeList(userData.upcoming),
+    prime: dedupeList(userData.prime),
+    favourite: dedupeList(userData.favourite),
+    expHistory: Array.isArray(userData.expHistory) ? userData.expHistory.slice(-100) : []
+  };
 }
 
-async function followUser(myUid, targetUid) {
-  if (myUid === targetUid) throw new Error('Cannot follow yourself');
-  await db.runTransaction(async (tx) => {
-    const meRef = db.collection('users').doc(myUid);
-    const tgRef = db.collection('users').doc(targetUid);
-    const meSnap = await tx.get(meRef);
-    const tgSnap = await tx.get(tgRef);
-    if (!meSnap.exists || !tgSnap.exists) throw new Error('User not found');
-    const following = meSnap.data().following || [];
-    const isFollowing = following.includes(targetUid);
-    tx.update(meRef, {
-      following: isFollowing
-        ? admin.firestore.FieldValue.arrayRemove(targetUid)
-        : admin.firestore.FieldValue.arrayUnion(targetUid)
-    });
-    tx.update(tgRef, {
-      followers: isFollowing
-        ? admin.firestore.FieldValue.arrayRemove(myUid)
-        : admin.firestore.FieldValue.arrayUnion(myUid)
-    });
+// ---- Update profile ----
+export async function updateProfile(uid, { name, avatar }) {
+  const updates = {};
+  if (name) updates.name = safeString(name, 60);
+  if (avatar) updates.avatar = validImageUrl(avatar);
+  if (Object.keys(updates).length === 0) throw new Error('Nothing to update');
+  await adminDb.doc('users/' + uid).update(updates);
+  return getUser(uid);
+}
+
+// ---- Complete setup ----
+export async function completeSetup(uid, { name, avatar }) {
+  const n = safeString(name, 60);
+  if (!n) throw new Error('Name is required');
+  await adminDb.doc('users/' + uid).update({
+    name: n,
+    avatar: validImageUrl(avatar),
+    setupCompleted: true
   });
-  return await getPublicUser(myUid);
+  return getUser(uid);
 }
 
-async function getRankInfo(uid) {
-  const user = await getUser(uid);
-  const cfg = await getAppConfig();
-  const th = cfg.rankThresholds;
-  const exp = user.totalExp || 0;
-  const rank = computeRank(exp, th);
-  let target = th.D;
-  if (exp >= th.A) target = th.A;
-  else if (exp >= th.B) target = th.A;
-  else if (exp >= th.C) target = th.B;
-  else if (exp >= th.D) target = th.C;
-  // Persist if changed
-  if (user.rank !== rank) {
-    try { await db.collection('users').doc(uid).update({ rank }); } catch (e) { }
+// ---- Backup email precheck ----
+export async function precheckBackupEmail(email, ownUid) {
+  const e = String(email || '').toLowerCase().trim();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e)) throw new Error('Invalid email format');
+
+  // Firebase Auth check
+  try {
+    const u = await adminAuth.getUserByEmail(e);
+    if (u.uid !== ownUid) throw new Error('Email already in use by another account');
+  } catch (err) {
+    if (err.code !== 'auth/user-not-found') {
+      if (err.message && err.message.includes('already in use')) throw err;
+    }
   }
-  return { rank, exp, target, thresholds: th };
+
+  // Firestore check
+  const usersRef = adminDb.collection('users');
+  const [emailSnap, backupSnap] = await Promise.all([
+    usersRef.where('email', '==', e).limit(1).get(),
+    usersRef.where('backupEmail', '==', e).limit(1).get()
+  ]);
+  if (!emailSnap.empty && emailSnap.docs[0].id !== ownUid) throw new Error('Email already in use');
+  if (!backupSnap.empty && backupSnap.docs[0].id !== ownUid) throw new Error('Email already linked as backup');
+
+  return true;
 }
 
-// ---------- ECONOMY ----------
-async function claimDailyBonus(uid) {
-  const today = new Date().toDateString();
-  const cfg = await getAppConfig();
-  const bonus = Number(cfg.dailyBonus) || 50;
-
-  return await db.runTransaction(async (tx) => {
-    const bankSnap = await tx.get(db.doc('meta/bank'));
-    if (!bankSnap.exists) throw new Error('Bank not initialized');
-    const bank = bankSnap.data();
-    const adminRef = db.collection('admins').doc(bank.treasuryAdminUid);
-    const adminSnap = await tx.get(adminRef);
-    if (!adminSnap.exists) throw new Error('Treasury admin missing');
-    const adminData = adminSnap.data();
-
-    const userRef = db.collection('users').doc(uid);
-    const userSnap = await tx.get(userRef);
-    if (!userSnap.exists) throw new Error('User not found');
-    const user = userSnap.data();
-
-    if (user.isBanned) throw new Error('Account banned');
-    if (user.lastClaim === today) throw new Error('Already claimed today');
-    if ((adminData.coins || 0) < bonus) throw new Error('Treasury has no coins. Contact admin.');
-
-    const newCoins = (user.coins || 0) + bonus;
-    tx.update(adminRef, { coins: (adminData.coins || 0) - bonus });
-    tx.update(userRef, { coins: newCoins, lastClaim: today });
-    tx.set(db.collection('coinTransactions').doc(), {
-      type: 'DAILY_CLAIM', from: 'admin', to: uid, amount: bonus,
-      userBalanceAfter: newCoins, timestamp: admin.firestore.FieldValue.serverTimestamp()
-    });
-    return { coins: newCoins };
-  });
+// ---- Save backup email ----
+export async function saveBackupEmail(uid, email) {
+  const e = String(email || '').toLowerCase().trim();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e)) throw new Error('Invalid email');
+  const snap = await adminDb.doc('users/' + uid).get();
+  if (!snap.exists) throw new Error('User not found');
+  if ((snap.data().backupEmail || '').trim()) throw new Error('Backup email cannot be changed once set');
+  await adminDb.doc('users/' + uid).update({ backupEmail: e });
+  return getUser(uid);
 }
 
-async function buyStoreItem(uid, itemId) {
-  const itemSnap = await db.collection('storeItems').doc(itemId).get();
-  if (!itemSnap.exists) throw new Error('Item not found');
-  const item = itemSnap.data();
-  if (!item.active) throw new Error('Item not available');
-
-  const durationDays = item.durationDays || 30;
-  const expiresAt = Date.now() + (durationDays * 24 * 60 * 60 * 1000);
-
-  return await db.runTransaction(async (tx) => {
-    const bankSnap = await tx.get(db.doc('meta/bank'));
-    const bank = bankSnap.data();
-    const adminRef = db.collection('admins').doc(bank.treasuryAdminUid);
-    const adminSnap = await tx.get(adminRef);
-    const adminData = adminSnap.data();
-
-    const userRef = db.collection('users').doc(uid);
-    const userSnap = await tx.get(userRef);
-    const user = userSnap.data();
-    if (user.isBanned) throw new Error('Account banned');
-    if ((user.coins || 0) < item.price) throw new Error('Insufficient coins');
-
-    const newCoins = (user.coins || 0) - item.price;
-    let owned = (user.ownedItems || []).filter(o => {
-      if (typeof o === 'string') return true;
-      return o.expiresAt > Date.now() && o.id !== itemId;
-    });
-    owned.push({ id: itemId, expiresAt });
-    const updates = { coins: newCoins, ownedItems: owned };
-    if ((item.type || 'border') === 'border') updates.activeBorder = item.cssClass;
-
-    tx.update(userRef, updates);
-    tx.update(adminRef, { coins: (adminData.coins || 0) + item.price });
-    tx.set(db.collection('coinTransactions').doc(), {
-      type: 'PURCHASE', from: uid, to: 'admin', amount: item.price,
-      meta: { itemId, itemName: item.name, durationDays },
-      userBalanceAfter: newCoins, timestamp: admin.firestore.FieldValue.serverTimestamp()
-    });
-    return { coins: newCoins, owned, activeBorder: updates.activeBorder };
-  });
-}
-
-// ---------- UPCOMING ----------
-async function addToUpcoming(uid, anime) {
-  const cfg = await getAppConfig();
-  const malId = String(anime.malId || '');
-  if (!malId) throw new Error('Missing malId');
-
-  return await db.runTransaction(async (tx) => {
-    const userRef = db.collection('users').doc(uid);
+// ---- Add to upcoming ----
+export async function addToUpcoming(uid, { malId, anilistId, title, img, totalEps }) {
+  const config = await loadAppConfig();
+  return await adminDb.runTransaction(async tx => {
+    const userRef = adminDb.doc('users/' + uid);
     const snap = await tx.get(userRef);
-    const user = snap.data();
-    if (user.isBanned) throw new Error('Account banned');
-    const upcoming = [...(user.upcoming || [])];
-    if (upcoming.some(u => String(u.malId) === malId)) throw new Error('Already in upcoming');
-    if (upcoming.length >= cfg.maxUpcoming) throw new Error(`Upcoming full (max ${cfg.maxUpcoming})`);
-    const item = {
-      malId,
-      anilistId: anime.anilistId || null,
-      title: safeString(anime.title || '', 200),
-      img: validImageUrl(anime.img),
+    if (!snap.exists) throw new Error('User not found');
+    const userData = snap.data();
+    const up = Array.isArray(userData.upcoming) ? userData.upcoming : [];
+    const mi = String(malId);
+    if (up.some(u => String(u.malId) === mi)) throw new Error('Already in Upcoming');
+    if (up.length >= config.maxUpcoming) throw new Error(`Upcoming full (max ${config.maxUpcoming})`);
+    const newItem = {
+      malId: mi,
+      anilistId: String(anilistId || ''),
+      title: safeString(title, 200),
+      img: validImageUrl(img),
       currentEp: 0,
-      totalEps: anime.totalEps || 12,
+      totalEps: toNumber(totalEps, 12),
       lastWatchedDate: ''
     };
-    upcoming.push(item);
-    tx.update(userRef, { upcoming });
-    return { upcoming };
+    tx.update(userRef, { upcoming: [...up, newItem] });
+    return { ...userData, upcoming: [...up, newItem] };
   });
 }
 
-async function removeFromUpcoming(uid, malId) {
-  return await db.runTransaction(async (tx) => {
-    const userRef = db.collection('users').doc(uid);
-    const snap = await tx.get(userRef);
-    const upcoming = (snap.data().upcoming || []).filter(u => String(u.malId) !== String(malId));
-    tx.update(userRef, { upcoming });
-    return { upcoming };
-  });
+// ---- Remove from upcoming ----
+export async function removeFromUpcoming(uid, malId) {
+  const userRef = adminDb.doc('users/' + uid);
+  const snap = await userRef.get();
+  if (!snap.exists) throw new Error('User not found');
+  const up = (snap.data().upcoming || []).filter(u => String(u.malId) !== String(malId));
+  await userRef.update({ upcoming: up });
+  return getUser(uid);
 }
 
-async function incrementWatchingEpisode(uid, malId) {
-  const today = new Date().toDateString();
-  const cfg = await getAppConfig();
-
-  return await db.runTransaction(async (tx) => {
-    const userRef = db.collection('users').doc(uid);
+// ---- Increment episode ----
+export async function incrementEpisode(uid, malId) {
+  const today = getTodayKey();
+  return await adminDb.runTransaction(async tx => {
+    const userRef = adminDb.doc('users/' + uid);
     const snap = await tx.get(userRef);
-    const user = snap.data();
-    if (user.isBanned) throw new Error('Account banned');
+    if (!snap.exists) throw new Error('User not found');
+    const userData = snap.data();
+    if (userData.isBanned) throw new Error('Account banned');
 
-    const upcoming = [...(user.upcoming || [])];
-    const idx = upcoming.findIndex(u => String(u.malId) === String(malId));
-    if (idx === -1) throw new Error('Not in upcoming');
-    const item = { ...upcoming[idx] };
-    if (item.lastWatchedDate === today) throw new Error('Only 1 episode per day allowed');
-    item.currentEp = (item.currentEp || 0) + 1;
+    const liveUpcoming = [...(userData.upcoming || [])];
+    const idx = liveUpcoming.findIndex(u => String(u.malId) === String(malId));
+    if (idx === -1) throw new Error('Item not in upcoming');
+    const item = { ...liveUpcoming[idx] };
+    if (item.lastWatchedDate === today) throw new Error('Only 1 episode per day');
+    item.currentEp = toNumber(item.currentEp) + 1;
     item.lastWatchedDate = today;
-    upcoming[idx] = item;
+    liveUpcoming[idx] = item;
 
-    const complete = item.currentEp >= (item.totalEps || 12);
-    if (!complete) {
-      tx.update(userRef, { upcoming });
-      return { complete: false, upcoming };
+    const isComplete = item.currentEp >= toNumber(item.totalEps, 12);
+    if (!isComplete) {
+      tx.update(userRef, { upcoming: liveUpcoming });
+      return { completed: false, userData: { ...userData, upcoming: liveUpcoming } };
     }
 
-    // Completion rewards
-    const bankSnap = await tx.get(db.doc('meta/bank'));
-    const bank = bankSnap.data();
-    const adminRef = db.collection('admins').doc(bank.treasuryAdminUid);
-    const adminSnap = await tx.get(adminRef);
-    const adminData = adminSnap.data();
+    // Completion path: award 50 EXP + 10 coins (from admin bank)
+    const { adminRef, admin } = await getBankAndAdmin(tx);
     const rewardCoins = 10;
-    const canPay = (adminData.coins || 0) >= rewardCoins;
+    const canPay = toNumber(admin.coins) >= rewardCoins;
 
-    const filtered = upcoming.filter(u => String(u.malId) !== String(malId));
-    const collection = [...(user.collection || [])];
-    if (!collection.some(c => String(c.malId) === String(malId))) {
+    const remaining = liveUpcoming.filter(u => String(u.malId) !== String(malId));
+    const collection = [...(userData.collection || [])];
+    if (!collection.some(x => String(x.malId) === String(malId))) {
       collection.push({ malId: String(item.malId), anilistId: item.anilistId || null, title: item.title, img: item.img });
     }
 
-    const newExp = (user.totalExp || 0) + 50;
-    const newRank = computeRank(newExp, cfg.rankThresholds);
-    const updates = {
-      upcoming: filtered,
+    const newExpHistory = [...(userData.expHistory || []), {
+      amount: 50, reason: `Completed ${item.title}`, date: new Date().toISOString()
+    }].slice(-100);
+
+    const userUpdate = {
+      upcoming: remaining,
       collection,
-      totalExp: newExp,
-      rank: newRank,
-      expHistory: admin.firestore.FieldValue.arrayUnion({
-        amount: 50, reason: `Completed ${item.title}`, date: new Date().toISOString()
-      }),
+      totalExp: FieldValue.increment(50),
+      expHistory: newExpHistory
     };
-    if (canPay) updates.coins = admin.firestore.FieldValue.increment(rewardCoins);
-    tx.update(userRef, updates);
+    if (canPay) userUpdate.coins = FieldValue.increment(rewardCoins);
+    tx.update(userRef, userUpdate);
 
     if (canPay) {
-      tx.update(adminRef, { coins: (adminData.coins || 0) - rewardCoins });
-      tx.set(db.collection('coinTransactions').doc(), {
+      tx.update(adminRef, { coins: toNumber(admin.coins) - rewardCoins });
+      tx.set(adminDb.collection('coinTransactions').doc(), {
         type: 'ANIME_COMPLETE', from: 'admin', to: uid, amount: rewardCoins,
         meta: { animeId: item.malId, animeTitle: item.title },
-        userBalanceAfter: (user.coins || 0) + rewardCoins,
-        timestamp: admin.firestore.FieldValue.serverTimestamp()
+        userBalanceAfter: toNumber(userData.coins) + rewardCoins,
+        timestamp: FieldValue.serverTimestamp()
       });
     }
 
-    return { complete: true, title: item.title, coinsPaid: canPay, newRank };
+    return {
+      completed: true, title: item.title,
+      newCoins: canPay ? toNumber(userData.coins) + rewardCoins : toNumber(userData.coins),
+      newTotalExp: toNumber(userData.totalExp) + 50,
+      coinsPaid: canPay
+    };
   });
 }
 
-// ---------- COLLECTION ----------
-async function togglePrime(uid, malId) {
-  const cfg = await getAppConfig();
-  return await db.runTransaction(async (tx) => {
-    const ref = db.collection('users').doc(uid);
-    const snap = await tx.get(ref);
-    const user = snap.data();
-    const anime = (user.collection || []).find(c => String(c.malId) === String(malId));
-    if (!anime) throw new Error('Not in collection');
-    const prime = [...(user.prime || [])];
-    const idx = prime.findIndex(p => String(p.malId) === String(malId));
-    if (idx > -1) prime.splice(idx, 1);
-    else {
-      if (prime.length >= cfg.maxPrime) throw new Error(`Max ${cfg.maxPrime} prime`);
-      prime.push({ malId: String(malId), anilistId: anime.anilistId || null, title: anime.title, img: anime.img });
+// ---- Toggle prime ----
+export async function togglePrime(uid, malId) {
+  const config = await loadAppConfig();
+  const userRef = adminDb.doc('users/' + uid);
+  const snap = await userRef.get();
+  if (!snap.exists) throw new Error('User not found');
+  const userData = snap.data();
+  const prime = [...(userData.prime || [])];
+  const mi = String(malId);
+  const anime = (userData.collection || []).find(c => String(c.malId) === mi);
+  if (!anime) throw new Error('Anime not in collection');
+  const idx = prime.findIndex(p => String(p.malId) === mi);
+  if (idx > -1) prime.splice(idx, 1);
+  else {
+    if (prime.length >= config.maxPrime) throw new Error(`Max ${config.maxPrime} Prime slots`);
+    prime.push({ malId: mi, anilistId: anime.anilistId || null, title: anime.title, img: anime.img });
+  }
+  await userRef.update({ prime });
+  return getUser(uid);
+}
+
+// ---- Toggle favourite ----
+export async function toggleFavourite(uid, malId) {
+  const config = await loadAppConfig();
+  const userRef = adminDb.doc('users/' + uid);
+  const snap = await userRef.get();
+  if (!snap.exists) throw new Error('User not found');
+  const userData = snap.data();
+  const fav = [...(userData.favourite || [])];
+  const mi = String(malId);
+  const anime = (userData.collection || []).find(c => String(c.malId) === mi);
+  if (!anime) throw new Error('Anime not in collection');
+  const idx = fav.findIndex(f => String(f.malId) === mi);
+  if (idx > -1) fav.splice(idx, 1);
+  else {
+    if (fav.length >= config.maxFavourite) throw new Error(`Max ${config.maxFavourite} Favourite slots`);
+    fav.push({ malId: mi, anilistId: anime.anilistId || null, title: anime.title, img: anime.img });
+  }
+  await userRef.update({ favourite: fav });
+  return getUser(uid);
+}
+
+// ---- Follow / unfollow ----
+export async function toggleFollow(uid, targetUid) {
+  if (uid === targetUid) throw new Error('Cannot follow yourself');
+  return await adminDb.runTransaction(async tx => {
+    const myRef = adminDb.doc('users/' + uid);
+    const targetRef = adminDb.doc('users/' + targetUid);
+    const [mySnap, targetSnap] = await Promise.all([tx.get(myRef), tx.get(targetRef)]);
+    if (!mySnap.exists || !targetSnap.exists) throw new Error('User not found');
+    const myFollowing = mySnap.data().following || [];
+    const isFollowing = myFollowing.includes(targetUid);
+    if (isFollowing) {
+      tx.update(myRef, { following: FieldValue.arrayRemove(targetUid) });
+      tx.update(targetRef, { followers: FieldValue.arrayRemove(uid) });
+    } else {
+      tx.update(myRef, { following: FieldValue.arrayUnion(targetUid) });
+      tx.update(targetRef, { followers: FieldValue.arrayUnion(uid) });
     }
-    tx.update(ref, { prime });
-    return { prime };
+    return { following: !isFollowing };
   });
 }
 
-async function toggleFavorite(uid, malId) {
-  const cfg = await getAppConfig();
-  return await db.runTransaction(async (tx) => {
-    const ref = db.collection('users').doc(uid);
-    const snap = await tx.get(ref);
-    const user = snap.data();
-    const anime = (user.collection || []).find(c => String(c.malId) === String(malId));
-    if (!anime) throw new Error('Not in collection');
-    const fav = [...(user.favourite || [])];
-    const idx = fav.findIndex(f => String(f.malId) === String(malId));
-    if (idx > -1) fav.splice(idx, 1);
-    else {
-      if (fav.length >= cfg.maxFavourite) throw new Error(`Max ${cfg.maxFavourite} favourites`);
-      fav.push({ malId: String(malId), anilistId: anime.anilistId || null, title: anime.title, img: anime.img });
-    }
-    tx.update(ref, { favourite: fav });
-    return { favourite: fav };
-  });
-}
+// ---- Daily claim ----
+export async function claimDaily(uid) {
+  const config = await loadAppConfig();
+  const today = getTodayKey();
+  const bonus = toNumber(config.dailyBonus, 50);
 
-// ---------- POLLS ----------
-async function createPoll(uid, data) {
-  const user = await getUser(uid);
-  const { animeTitle, question, options, correctIndex } = data || {};
-  const opts = (options || []).map(o => safeString(o, 150)).filter(Boolean);
-  if (!animeTitle || !question || opts.length !== 4) throw new Error('Invalid poll data');
-  if (correctIndex < 0 || correctIndex > 3) throw new Error('Invalid correct answer');
-  const ref = await db.collection('polls').add({
-    animeTitle: safeString(animeTitle, 100),
-    question: safeString(question, 300),
-    options: opts,
-    correctIndex: Number(correctIndex),
-    creatorId: uid,
-    creatorName: user.name,
-    voters: [],
-    flags: [],
-    createdAt: admin.firestore.FieldValue.serverTimestamp(),
-  });
-  return { id: ref.id };
-}
+  return await adminDb.runTransaction(async tx => {
+    const { adminRef, admin } = await getBankAndAdmin(tx);
+    const userRef = adminDb.doc('users/' + uid);
+    const snap = await tx.get(userRef);
+    if (!snap.exists) throw new Error('User not found');
+    const userData = snap.data();
+    if (userData.isBanned) throw new Error('Account banned');
+    if (userData.lastClaim === today) throw new Error('Already claimed today');
+    if (toNumber(admin.coins) < bonus) throw new Error('Treasury empty. Try later.');
 
-async function listPolls(uid) {
-  const snap = await db.collection('polls').orderBy('createdAt', 'desc').limit(50).get();
-  return snap.docs
-    .map(d => ({ id: d.id, ...d.data() }))
-    .filter(p => p.creatorId !== uid)
-    .map(p => {
-      const { correctIndex, ...safe } = p;
-      return safe;
+    tx.update(adminRef, { coins: toNumber(admin.coins) - bonus });
+    tx.update(userRef, { coins: toNumber(userData.coins) + bonus, lastClaim: today });
+    tx.set(adminDb.collection('coinTransactions').doc(), {
+      type: 'DAILY_CLAIM', from: 'admin', to: uid, amount: bonus,
+      userBalanceAfter: toNumber(userData.coins) + bonus,
+      timestamp: FieldValue.serverTimestamp()
     });
-}
-
-async function listMyPolls(uid) {
-  const snap = await db.collection('polls').where('creatorId', '==', uid).get();
-  return snap.docs.map(d => {
-    const { correctIndex, ...safe } = { id: d.id, ...d.data() };
-    return safe;
+    return { newCoins: toNumber(userData.coins) + bonus, lastClaim: today };
   });
 }
 
-async function answerPoll(uid, pollId, optionIndex) {
-  const cfg = await getAppConfig();
-  return await db.runTransaction(async (tx) => {
-    const pollRef = db.collection('polls').doc(pollId);
-    const pollSnap = await tx.get(pollRef);
+// ---- Store ----
+export async function getStoreItems() {
+  const snap = await adminDb.collection('storeItems').where('active', '==', true).get();
+  return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+}
+
+export async function buyItem(uid, itemId) {
+  const itemSnap = await adminDb.doc('storeItems/' + itemId).get();
+  if (!itemSnap.exists) throw new Error('Item not found');
+  const item = { id: itemSnap.id, ...itemSnap.data() };
+  if (!item.active) throw new Error('Item not available');
+  const price = toNumber(item.price);
+  const durationDays = toNumber(item.durationDays, 30);
+  const expiresAt = Date.now() + durationDays * 24 * 60 * 60 * 1000;
+
+  return await adminDb.runTransaction(async tx => {
+    const { adminRef, admin } = await getBankAndAdmin(tx);
+    const userRef = adminDb.doc('users/' + uid);
+    const snap = await tx.get(userRef);
+    if (!snap.exists) throw new Error('User not found');
+    const userData = snap.data();
+    if (userData.isBanned) throw new Error('Account banned');
+    if (toNumber(userData.coins) < price) throw new Error('Insufficient coins');
+
+    const newCoins = toNumber(userData.coins) - price;
+    let newOwned = (userData.ownedItems || []).filter(o => {
+      if (typeof o === 'string') return true;
+      return o.expiresAt > Date.now() && o.id !== item.id;
+    });
+    newOwned.push({ id: item.id, expiresAt });
+
+    const upd = { coins: newCoins, ownedItems: newOwned };
+    if ((item.type || 'border') === 'border') upd.activeBorder = item.cssClass;
+
+    tx.update(userRef, upd);
+    tx.update(adminRef, { coins: toNumber(admin.coins) + price });
+    tx.set(adminDb.collection('coinTransactions').doc(), {
+      type: 'PURCHASE', from: uid, to: 'admin', amount: price,
+      meta: { itemId: item.id, itemName: item.name, durationDays },
+      userBalanceAfter: newCoins, timestamp: FieldValue.serverTimestamp()
+    });
+    return { newCoins, newOwnedItems: newOwned, activeBorder: upd.activeBorder || userData.activeBorder };
+  });
+}
+
+// ---- Polls ----
+export async function createPoll(uid, { animeName, question, options, correctIndex }) {
+  const userSnap = await adminDb.doc('users/' + uid).get();
+  if (!userSnap.exists) throw new Error('User not found');
+  const creatorName = userSnap.data().name || 'User';
+
+  const doc = await adminDb.collection('polls').add({
+    animeTitle: safeString(animeName, 100),
+    question: safeString(question, 300),
+    options: options.map(o => safeString(o, 150)),
+    correctIndex: toNumber(correctIndex),
+    creatorId: uid, creatorName,
+    voters: [], flags: [],
+    createdAt: FieldValue.serverTimestamp()
+  });
+  return { pollId: doc.id };
+}
+
+export async function listPolls(uid) {
+  const snap = await adminDb.collection('polls').get();
+  return snap.docs.map(d => ({ id: d.id, ...d.data() }))
+    .filter(p => p.creatorId !== uid);
+}
+
+export async function listMyPolls(uid) {
+  const snap = await adminDb.collection('polls').where('creatorId', '==', uid).get();
+  return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+}
+
+export async function answerPoll(uid, pollId, selectedIndex) {
+  return await adminDb.runTransaction(async tx => {
+    const pollRef = adminDb.doc('polls/' + pollId);
+    const userRef = adminDb.doc('users/' + uid);
+    const [pollSnap, userSnap] = await Promise.all([tx.get(pollRef), tx.get(userRef)]);
     if (!pollSnap.exists) throw new Error('Poll not found');
+    if (!userSnap.exists) throw new Error('User not found');
     const poll = pollSnap.data();
-    if (poll.creatorId === uid) throw new Error('Cannot answer own poll');
+    const userData = userSnap.data();
+    if (poll.creatorId === uid) throw new Error('Cannot answer your own poll');
     if ((poll.voters || []).includes(uid)) throw new Error('Already answered');
-    if (optionIndex < 0 || optionIndex >= (poll.options || []).length) throw new Error('Invalid option');
-    const correct = Number(optionIndex) === Number(poll.correctIndex);
+    const idx = toNumber(selectedIndex);
+    if (idx < 0 || idx >= (poll.options || []).length) throw new Error('Invalid option');
 
-    const userRef = db.collection('users').doc(uid);
-    const userSnap = await tx.get(userRef);
-    const user = userSnap.data();
+    const isCorrect = idx === toNumber(poll.correctIndex);
+    tx.update(pollRef, { voters: FieldValue.arrayUnion(uid) });
 
-    tx.update(pollRef, { voters: admin.firestore.FieldValue.arrayUnion(uid) });
-    if (poll.creatorId) {
-      tx.update(db.collection('users').doc(poll.creatorId), {
-        totalExp: admin.firestore.FieldValue.increment(15)
-      });
+    if (poll.creatorId && poll.creatorId !== uid) {
+      tx.update(adminDb.doc('users/' + poll.creatorId), { totalExp: FieldValue.increment(15) });
     }
 
     let awarded = { exp: 0, coins: 0 };
-    if (correct) {
-      const bankSnap = await tx.get(db.doc('meta/bank'));
-      const bank = bankSnap.data();
-      const adminRef = db.collection('admins').doc(bank.treasuryAdminUid);
-      const adminSnap = await tx.get(adminRef);
-      const adminData = adminSnap.data();
-      if ((adminData.coins || 0) >= 5) {
-        const newExp = (user.totalExp || 0) + 10;
-        tx.update(adminRef, { coins: (adminData.coins || 0) - 5 });
-        tx.update(userRef, {
-          totalExp: newExp,
-          rank: computeRank(newExp, cfg.rankThresholds),
-          coins: admin.firestore.FieldValue.increment(5),
-          expHistory: admin.firestore.FieldValue.arrayUnion({
-            amount: 10, reason: 'Correct poll answer', date: new Date().toISOString()
-          }),
+    if (isCorrect) {
+      const { adminRef, admin } = await getBankAndAdmin(tx);
+      const newExpHistory = [...(userData.expHistory || []), {
+        amount: 10, reason: 'Correct poll answer', date: new Date().toISOString()
+      }].slice(-100);
+
+      const userUpd = {
+        totalExp: FieldValue.increment(10),
+        expHistory: newExpHistory
+      };
+
+      if (toNumber(admin.coins) >= 5) {
+        tx.update(adminRef, { coins: toNumber(admin.coins) - 5 });
+        userUpd.coins = FieldValue.increment(5);
+        tx.set(adminDb.collection('coinTransactions').doc(), {
+          type: 'POLL_REWARD', from: 'admin', to: uid, amount: 5, meta: { pollId },
+          userBalanceAfter: toNumber(userData.coins) + 5,
+          timestamp: FieldValue.serverTimestamp()
         });
-        tx.set(db.collection('coinTransactions').doc(), {
-          type: 'POLL_REWARD', from: 'admin', to: uid, amount: 5,
-          meta: { pollId }, userBalanceAfter: (user.coins || 0) + 5,
-          timestamp: admin.firestore.FieldValue.serverTimestamp()
-        });
-        awarded = { exp: 10, coins: 5 };
+        awarded.coins = 5;
       }
+      tx.update(userRef, userUpd);
+      awarded.exp = 10;
     }
-    return { correct, awarded };
+    return { isCorrect, awarded };
   });
 }
 
-async function reportPoll(uid, pollId) {
-  await db.collection('polls').doc(pollId).update({
-    flags: admin.firestore.FieldValue.arrayUnion(uid)
-  });
+export async function reportPoll(uid, pollId) {
+  await adminDb.doc('polls/' + pollId).update({ flags: FieldValue.arrayUnion(uid) });
+  return true;
 }
 
-// ---------- LEADERBOARD ----------
-async function getLeaderboard() {
-  const snap = await db.collection('users').orderBy('totalExp', 'desc').limit(10).get();
-  return snap.docs.map((d, i) => {
+// ---- Leaderboard ----
+export async function getLeaderboard(limitCount = 10) {
+  const snap = await adminDb.collection('users').orderBy('totalExp', 'desc').limit(limitCount).get();
+  return snap.docs.map(d => {
     const u = d.data();
     return {
-      rank: i + 1, uid: d.id, name: u.name, avatar: u.avatar,
-      rankLabel: u.rank || 'E', totalExp: u.totalExp || 0
+      uid: d.id, name: u.name || 'User',
+      avatar: validImageUrl(u.avatar), rank: u.rank || 'E',
+      totalExp: toNumber(u.totalExp)
     };
   });
 }
 
-// ---------- ANILIST ----------
-async function anilistQuery(query, variables) {
-  const r = await fetch(apis.anilist, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-    body: JSON.stringify({ query, variables }),
-  });
-  const data = await r.json();
-  if (data.errors) throw new Error('AniList error: ' + data.errors[0]?.message);
-  return data.data;
-}
-
-async function getTrendingAnime(page = 1) {
-  const q = `query($page:Int){Page(page:$page,perPage:20){media(sort:POPULARITY_DESC,type:ANIME){id idMal title{romaji english} coverImage{large} averageScore episodes}}}`;
-  const data = await anilistQuery(q, { page });
-  return data.Page.media.map(a => ({
-    id: a.id, malId: a.idMal || `ali_${a.id}`,
-    title: a.title.english || a.title.romaji || 'Unknown',
-    img: a.coverImage?.large || '',
-    score: a.averageScore || null,
-    episodes: a.episodes || null,
-  }));
-}
-
-async function searchAnime(params) {
-  const { text, genre, year, format, status, score } = params;
-  const argParts = ['type:ANIME', 'sort:POPULARITY_DESC'];
-  const vars = {};
-  const types = { search: 'String', genre: 'String', year: 'Int', format: 'MediaFormat', status: 'MediaStatus', score: 'Int' };
-  if (text) { argParts.push('search:$search'); vars.search = text; }
-  if (genre) { argParts.push('genre:$genre'); vars.genre = genre; }
-  if (year) { argParts.push('seasonYear:$year'); vars.year = parseInt(year); }
-  if (format) { argParts.push('format:$format'); vars.format = format; }
-  if (status) { argParts.push('status:$status'); vars.status = status; }
-  if (score) { argParts.push('averageScore_greater:$score'); vars.score = parseInt(score); }
-  const varDefs = Object.keys(vars).map(k => `$${k}:${types[k]}`).join(',');
-  const q = varDefs
-    ? `query(${varDefs}){Page(page:1,perPage:50){media(${argParts.join(',')}){id idMal title{romaji english} coverImage{large} averageScore episodes}}}`
-    : `{Page(page:1,perPage:50){media(${argParts.join(',')}){id idMal title{romaji english} coverImage{large} averageScore episodes}}}`;
-  const data = await anilistQuery(q, vars);
-  return data.Page.media.map(a => ({
-    id: a.id, malId: a.idMal || `ali_${a.id}`,
-    title: a.title.english || a.title.romaji || 'Unknown',
-    img: a.coverImage?.large || '', score: a.averageScore || null,
-  }));
-}
-
-async function getAnimeDetails(anilistId, malId) {
-  const FIELDS = `id idMal title{romaji english} coverImage{extraLarge large} bannerImage averageScore episodes description genres externalLinks{site url type}`;
-  let q, v;
-  if (anilistId && /^\d+$/.test(String(anilistId))) {
-    q = `query($id:Int){Media(id:$id,type:ANIME){${FIELDS}}}`;
-    v = { id: parseInt(anilistId) };
-  } else if (malId && /^\d+$/.test(String(malId))) {
-    q = `query($malId:Int){Media(idMal:$malId,type:ANIME){${FIELDS}}}`;
-    v = { malId: parseInt(malId) };
-  } else throw new Error('Invalid anime id');
-  const data = await anilistQuery(q, v);
-  if (!data.Media) throw new Error('Anime not found');
-  return data.Media;
-}
-
-// ---------- MANGADEX ----------
-async function getTrendingManga(page = 1) {
-  const offset = (page - 1) * 20;
-  const r = await fetch(`${apis.mangadex}/manga?limit=20&offset=${offset}&includes[]=cover_art&order[followedCount]=desc`);
-  const d = await r.json();
-  return (d.data || []).map(m => {
-    const title = m.attributes?.title?.en || Object.values(m.attributes?.title || {})[0] || 'Unknown';
-    const cover = (m.relationships || []).find(x => x.type === 'cover_art');
-    const img = cover?.attributes?.fileName
-      ? `${apis.mangadexCovers}/covers/${m.id}/${cover.attributes.fileName}.256.jpg`
-      : '';
-    return { id: m.id, title, img };
-  });
-}
-
-async function searchManga(text) {
-  const r = await fetch(`${apis.mangadex}/manga?title=${encodeURIComponent(text || '')}&limit=20&includes[]=cover_art&order[relevance]=desc`);
-  const d = await r.json();
-  return (d.data || []).map(m => {
-    const title = m.attributes?.title?.en || Object.values(m.attributes?.title || {})[0] || 'Unknown';
-    const cover = (m.relationships || []).find(x => x.type === 'cover_art');
-    const img = cover?.attributes?.fileName
-      ? `${apis.mangadexCovers}/covers/${m.id}/${cover.attributes.fileName}.256.jpg`
-      : '';
-    return { id: m.id, title, img };
-  });
-}
-
-async function getMangaDetails(id) {
-  const r = await fetch(`${apis.mangadex}/manga/${encodeURIComponent(id)}`);
-  const d = await r.json();
-  if (!d.data) throw new Error('Manga not found');
-  const m = d.data;
-  const desc = m.attributes?.description?.en || Object.values(m.attributes?.description || {})[0] || 'No description';
-  const genres = (m.attributes?.tags || [])
-    .filter(t => t.attributes?.group === 'genre')
-    .map(t => t.attributes?.name?.en).filter(Boolean).slice(0, 5);
-  return {
-    id: m.id,
-    title: m.attributes?.title?.en || Object.values(m.attributes?.title || {})[0] || 'Manga',
-    description: desc,
-    status: m.attributes?.status,
-    genres,
-  };
-}
-
-// ---------- SCHEDULE ----------
-async function getAiringSchedule() {
-  const now = new Date();
-  now.setHours(0, 0, 0, 0);
-  const from = Math.floor(now.getTime() / 1000);
-  const weekEnd = new Date(now);
-  weekEnd.setDate(weekEnd.getDate() + 7);
-  const to = Math.floor(weekEnd.getTime() / 1000);
-
-  const all = [];
-  let page = 1;
-  let hasNext = true;
-  while (hasNext && page <= 20) {
-    const q = `query($from:Int,$to:Int,$page:Int){Page(page:$page,perPage:50){pageInfo{hasNextPage}airingSchedules(airingAt_greater:$from,airingAt_lesser:$to,sort:TIME){airingAt episode media{id idMal title{romaji english} coverImage{large}}}}}`;
-    const data = await anilistQuery(q, { from, to, page });
-    const p = data.Page;
-    all.push(...(p.airingSchedules || []));
-    hasNext = !!p.pageInfo?.hasNextPage && (p.airingSchedules || []).length === 50;
-    page++;
-  }
-
-  const groups = {};
-  all.forEach(a => {
-    const dt = new Date(a.airingAt * 1000);
-    const key = dt.toDateString();
-    if (!groups[key]) groups[key] = { date: dt.toISOString(), items: [] };
-    groups[key].items.push({
-      airingAt: a.airingAt,
-      episode: a.episode,
-      media: {
-        id: a.media?.id,
-        malId: a.media?.idMal || `ali_${a.media?.id}`,
-        title: a.media?.title?.english || a.media?.title?.romaji || 'Unknown',
-        img: a.media?.coverImage?.large || '',
-      }
+// ---- Followers data ----
+export async function getFollowersData(uid) {
+  const snap = await adminDb.doc('users/' + uid).get();
+  if (!snap.exists) throw new Error('User not found');
+  const followerUids = snap.data().followers || [];
+  if (!followerUids.length) return [];
+  const results = [];
+  for (let i = 0; i < followerUids.length; i += 10) {
+    const chunk = followerUids.slice(i, i + 10);
+    const q = await adminDb.collection('users').where('__name__', 'in', chunk).get();
+    q.docs.forEach(d => {
+      const u = d.data();
+      results.push({ uid: d.id, name: u.name || 'User', avatar: validImageUrl(u.avatar), rank: u.rank || 'E' });
     });
+  }
+  return results;
+}
+
+// ---- Rank breakdown ----
+export async function getRankBreakdown(uid) {
+  const snap = await adminDb.doc('users/' + uid).get();
+  if (!snap.exists) throw new Error('User not found');
+  const userData = snap.data();
+  const history = Array.isArray(userData.expHistory) ? userData.expHistory : [];
+  const totalExp = toNumber(userData.totalExp) || 1;
+  const grouped = {};
+  history.forEach(h => {
+    const r = String(h.reason || 'Other');
+    grouped[r] = (grouped[r] || 0) + toNumber(h.amount);
   });
-
-  return Object.entries(groups).map(([key, g]) => ({
-    date: key,
-    label: new Date(g.date).toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' }),
-    items: g.items,
+  const sorted = Object.entries(grouped).sort((a, b) => b[1] - a[1]);
+  return sorted.map(([reason, amount]) => ({
+    reason, amount, percentage: ((amount / totalExp) * 100).toFixed(1)
   }));
 }
 
-async function getSeasonal(season, year) {
-  const q = `query($season:MediaSeason,$year:Int){Page(page:1,perPage:50){media(season:$season,seasonYear:$year,type:ANIME,sort:POPULARITY_DESC){id idMal title{romaji english} coverImage{large} averageScore episodes}}}`;
-  const data = await anilistQuery(q, { season, year: parseInt(year) });
-  return data.Page.media.map(a => ({
-    id: a.id, malId: a.idMal || `ali_${a.id}`,
-    title: a.title.english || a.title.romaji || 'Unknown',
-    img: a.coverImage?.large || '', score: a.averageScore,
-  }));
+// ---- User search by UID ----
+export async function findUserByCustomId(customId) {
+  const snap = await adminDb.collection('users').where('customId', '==', String(customId)).limit(1).get();
+  if (snap.empty) return null;
+  const d = snap.docs[0];
+  return sanitizeForPublic({ id: d.id, ...d.data() });
 }
 
-// ---------- SCANNER ----------
-async function scanAnime(imageBuffer, mimeType) {
-  let identifiedTitle = null, confidence = 0, anilistId = null, episode = null, timestamp = null, video = null;
+// ---- Image upload (ImgBB) ----
+export async function uploadImage(base64, name = 'upload') {
+  return await imgbbUpload(base64, name);
+}
 
+// ---- Scanner ----
+export async function scanImage(base64) {
+  let identifiedTitle = null, confidence = 0, anilistId = null;
+  let episode = null, timestamp = null, videoUrl = null, source = '';
+
+  // Try trace.moe first
   try {
-    const form = new FormData();
-    form.append('image', new Blob([imageBuffer], { type: mimeType }), 'image.jpg');
-    const r = await fetch(`${apis.traceMoe}/search?anilistInfo`, { method: 'POST', body: form });
-    const d = await r.json();
-    if (d.result && d.result.length > 0 && d.result[0].similarity >= 0.87) {
-      const m = d.result[0];
-      confidence = +(m.similarity * 100).toFixed(1);
+    const td = await traceMoe(base64);
+    if (td.result && td.result.length > 0 && td.result[0].similarity >= 0.87) {
+      const m = td.result[0];
+      confidence = (m.similarity * 100).toFixed(1);
       identifiedTitle = m.anilist?.title?.english || m.anilist?.title?.romaji;
       anilistId = m.anilist?.id || null;
-      episode = m.episode;
-      timestamp = m.from;
-      video = m.video;
+      episode = m.episode !== null ? `Episode ${m.episode}` : 'Movie / Special';
+      const min = Math.floor(m.from / 60);
+      const sec = Math.floor(m.from % 60);
+      timestamp = `${min}m ${sec < 10 ? '0' : ''}${sec}s`;
+      videoUrl = m.video || null;
+      source = 'Official Episode Scene (Exact Match)';
     }
-  } catch (e) { console.warn('trace.moe failed:', e.message); }
+  } catch (e) { /* trace.moe failed */ }
 
+  // Fallback: Gemini
   if (!identifiedTitle) {
     try {
-      const prompt = 'You are a strict Japanese Anime & Manga verification system. Return JSON only: {"isAnime":bool,"confidence":number,"animeTitle":string|null,"character":string|null,"rejectionReason":string|null}';
-      const payload = {
-        contents: [{
-          parts: [
-            { text: prompt },
-            { inline_data: { mime_type: mimeType, data: imageBuffer.toString('base64') } }
-          ]
-        }],
-        generationConfig: { responseMimeType: 'application/json', temperature: 0.1 }
-      };
-      const r = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${geminiKey}`,
-        { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }
-      );
-      const g = await r.json();
-      const txt = g.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
-      const clean = JSON.parse(txt.replace(/```json|```/g, '').trim());
-      if (!clean.isAnime || !clean.animeTitle || (clean.confidence && clean.confidence < 85)) {
-        return { isAnime: false, reason: clean.rejectionReason || 'This image is not anime' };
+      const g = await geminiDetect(base64);
+      if (!g.isAnime || !g.animeTitle || (g.confidence && g.confidence < 85)) {
+        return {
+          ok: false,
+          rejectionReason: g.rejectionReason || 'This image does not appear to be an anime.',
+          rejectionHeading: 'No Anime Detected'
+        };
       }
-      identifiedTitle = clean.animeTitle;
-      confidence = clean.confidence || 95;
+      identifiedTitle = g.animeTitle;
+      confidence = g.confidence ? Number(g.confidence).toFixed(1) : '95.0';
+      source = g.character ? `Character: ${g.character}` : 'Official Anime Artwork';
     } catch (e) {
-      return { isAnime: false, reason: 'Could not verify image' };
+      return {
+        ok: false,
+        rejectionHeading: 'Recognition Failed',
+        rejectionReason: 'Could not verify this image. Try a clear anime screenshot.'
+      };
     }
   }
 
-  let details = null;
-  if (anilistId) {
-    try { details = await getAnimeDetails(anilistId); } catch (e) { }
-  }
-  if (!details && identifiedTitle) {
-    try {
-      const results = await searchAnime({ text: identifiedTitle });
-      if (results[0]) details = await getAnimeDetails(results[0].id);
-    } catch (e) { }
-  }
+  // Enrich with AniList
+  let meta = null;
+  try {
+    meta = await fetchAnimeDetails(anilistId, null);
+    if (!meta && identifiedTitle) {
+      const q = `query($search:String){Media(search:$search,type:ANIME){id idMal title{romaji english} coverImage{large} averageScore episodes description genres}}`;
+      const { anilistQuery } = await import('./api.js');
+      const d = await anilistQuery(q, { search: identifiedTitle });
+      meta = d?.data?.Media || null;
+    }
+  } catch (e) { /* metadata failed */ }
 
   return {
-    isAnime: true,
-    title: details?.title?.english || details?.title?.romaji || identifiedTitle,
+    ok: true,
+    title: (meta?.title?.english || meta?.title?.romaji) || identifiedTitle,
     confidence,
-    episode, timestamp, video,
-    details,
+    episode, timestamp, videoUrl, source,
+    poster: meta?.coverImage?.large || '',
+    score: meta?.averageScore || '8.0',
+    totalEpisodes: meta?.episodes || 'Unknown',
+    synopsis: meta?.description || 'No description.',
+    genres: meta?.genres || []
   };
 }
 
-// ---------- MUSIC ----------
-async function getMusicStations() {
-  const r = await fetch(`${apis.radioBrowser}/json/stations/bytag/anime?limit=40&hidebroken=true&is_https=true&lastcheckok=1`);
-  const d = await r.json();
-  return (d || [])
-    .filter(s => s.url_resolved && /^https?:\/\//i.test(s.url_resolved))
-    .map(s => ({ name: s.name || 'Unknown', country: s.country || '', bitrate: s.bitrate || 0, url: s.url_resolved }));
+// ---- Episode title ----
+export async function getEpisodeTitle(title, epNumber) {
+  return await fetchKitsuEpisodeTitle(title, epNumber);
 }
-
-// ---------- NEWS ----------
-async function getNews() {
-  const target = apis.animeNewsRss;
-  const proxies = [apis.allorigins, apis.codetabs, apis.corsproxy];
-  for (const p of proxies) {
-    try {
-      const r = await fetch(p + encodeURIComponent(target));
-      if (!r.ok) continue;
-      const text = await r.text();
-      if (!text.includes('<rss') && !text.includes('<channel')) continue;
-      const items = [];
-      const re = /<item>([\s\S]*?)<\/item>/g;
-      let m;
-      while ((m = re.exec(text)) !== null) {
-        const chunk = m[1];
-        const get = (tag) => {
-          const mm = chunk.match(new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`));
-          return mm ? mm[1].replace(/<!\[CDATA\[|\]\]>/g, '').trim() : '';
-        };
-        items.push({
-          title: get('title'),
-          link: get('link'),
-          description: get('description'),
-          pubDate: get('pubDate'),
-        });
-      }
-      return items.slice(0, 25);
-    } catch (e) { continue; }
-  }
-  throw new Error('Could not fetch news');
-}
-
-// ---------- CELEBRATION GIF ----------
-async function getCelebrationGif() {
-  const r = await fetch(`${apis.nekosBest}/celebrate`);
-  const d = await r.json();
-  return d.results?.[0]?.url || '';
-}
-
-// ---------- AVATAR UPLOAD ----------
-async function uploadAvatar(buffer, mimeType) {
-  const form = new FormData();
-  form.append('image', new Blob([buffer], { type: mimeType }), 'avatar.jpg');
-  const r = await fetch(`https://api.imgbb.com/1/upload?key=${imgbbKey}`, { method: 'POST', body: form });
-  const d = await r.json();
-  if (!d.success) throw new Error('Upload failed');
-  return d.data.url;
-}
-
-module.exports = {
-  getAppConfig, computeRank,
-  handleGoogleAuth, handleBackupLogin, linkBackupEmail, changePassword,
-  getUser, getPublicUser, updateUserProfile, completeSetup, searchUserByUid, followUser, getRankInfo,
-  claimDailyBonus, buyStoreItem,
-  addToUpcoming, removeFromUpcoming, incrementWatchingEpisode,
-  togglePrime, toggleFavorite,
-  createPoll, listPolls, listMyPolls, answerPoll, reportPoll,
-  getLeaderboard,
-  getTrendingAnime, searchAnime, getAnimeDetails,
-  getTrendingManga, searchManga, getMangaDetails,
-  getAiringSchedule, getSeasonal,
-  scanAnime, getMusicStations, getNews, getCelebrationGif,
-  uploadAvatar,
-};
